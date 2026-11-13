@@ -16,6 +16,10 @@ type settings struct {
 	// Appearance is "light", "dark", or "" to follow the system.
 	Appearance string  `json:"appearance,omitempty"`
 	FontSize   float32 `json:"fontSize,omitempty"`
+	// Hosts are the remote hosts, and ActiveHost the ID of the one the
+	// window showed last ("" for this machine).
+	Hosts      []hostConfig `json:"hosts,omitempty"`
+	ActiveHost string       `json:"activeHost,omitempty"`
 }
 
 const defaultFontSize = 11.6
@@ -63,11 +67,9 @@ func (a *App) setFontSize(size float32) {
 	size = min(max(size, 8), 32)
 	prefs.FontSize = size
 	termFont.Size = size
-	for _, t := range a.tabs {
-		for _, p := range t.panes() {
-			if p.term != nil {
-				p.term.SetFont(termFont)
-			}
+	for _, p := range a.allPanes() {
+		if p.term != nil {
+			p.term.SetFont(termFont)
 		}
 	}
 	saveSettings()

@@ -5,6 +5,10 @@
 // replayed. The app talks to it over a Unix socket: a control connection of
 // JSON lines (requests and their responses), and one connection per
 // attached session that carries the terminal's bytes both ways.
+//
+// A server on another machine is reached through ssh (remote.go): ssh runs
+// GoRex there as a bridge (bridge.go), which carries the connections to
+// that machine's server over ssh's pipe, many in one.
 package rex
 
 import (
@@ -39,6 +43,10 @@ type Response struct {
 
 // CreateOptions start a session.
 type CreateOptions struct {
+	// ID is the session's, chosen by the client so that it knows it before
+	// the server answers, and so that creating it again is harmless: the
+	// server makes a session of an ID once. Empty, the server chooses.
+	ID string `json:"id,omitempty"`
 	// Command runs instead of the user's login shell.
 	Command []string `json:"command,omitempty"`
 	Dir     string   `json:"dir,omitempty"`
@@ -84,7 +92,13 @@ type Hello struct {
 	// its own, to replace a server of an older build.
 	Exe     string    `json:"exe,omitempty"`
 	ExeTime time.Time `json:"exeTime,omitzero"`
+	// Platform is the server's GOOS/GOARCH.
+	Platform string `json:"platform,omitempty"`
 }
+
+// Instance names a server's run: another one, after it restarted, has no
+// sessions of the one before.
+func (h Hello) Instance() string { return fmt.Sprintf("%d@%d", h.PID, h.Started.UnixNano()) }
 
 // HostInfo describes the machine the server runs on.
 type HostInfo struct {
@@ -106,6 +120,30 @@ type Attach struct {
 	SID  string `json:"sid"`
 	Cols int    `json:"cols"`
 	Rows int    `json:"rows"`
+	// Create starts the session, of ID SID, when the server has none of
+	// it: a pane opens with one round trip, and comes back after the
+	// server restarted.
+	Create *CreateOptions `json:"create,omitempty"`
+	// Scrollback limits the scrollback of the snapshot, in about as many
+	// bytes, for a client at the end of a slow link: 0 sends it all.
+	Scrollback int `json:"scrollback,omitempty"`
+	// Backlog is how many bytes of output may wait for the client before
+	// the server drops it, to attach again and get the screen as it is
+	// then, rather than all that scrolled by: 0 is the server's default.
+	Backlog int `json:"backlog,omitempty"`
+}
+
+// validID tells an ID a client may give a session.
+func validID(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // Dir returns the directory of the server's socket, log and state.

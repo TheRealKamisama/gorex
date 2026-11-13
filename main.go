@@ -5,6 +5,7 @@
 //
 //	go tool mygo dev    the app, rebuilt as the code changes
 //	go run . -server    the session server alone, in the foreground
+//	gorex -bridge       what ssh runs on a remote host (remote.go)
 package main
 
 import (
@@ -30,6 +31,13 @@ func main() {
 		}
 		return
 	}
+	// -bridge serves a GoRex on another machine, which ssh ran it for.
+	if len(os.Args) > 1 && os.Args[1] == "-bridge" {
+		if err := rex.Bridge(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	// The state of the sessions lives in the app's data directory, which
 	// the server it starts takes from GOREX_DIR: "GoRex", or "GoRex Dev"
 	// under mygo dev, which keeps the installed app's sessions apart.
@@ -40,7 +48,7 @@ func main() {
 	}
 	registerFonts()
 	loadSettings()
-	a := &App{}
+	a := newApp(nil)
 	mygo.App.SetMenu(a.menu())
 	mygo.App.WhenReady(a.open)
 	mygo.App.OnActivate(func(hasVisibleWindows bool) {
@@ -70,14 +78,15 @@ func (a *App) open() {
 		mygo.App.Quit()
 		return
 	}
-	a.client = client
-	a.hello, err = client.Hello()
-	if err == nil && mygo.IsDev() && staleServer(a.hello) {
+	h := &Host{client: client, loaded: true}
+	a.hosts, a.host = []*Host{h}, h
+	h.hello, err = client.Hello()
+	if err == nil && mygo.IsDev() && staleServer(h.hello) {
 		// A server a build before this one started runs that build's
 		// code: start one of this build's, ending its sessions.
-		if client, err = client.Restart(a.hello.PID); err == nil {
-			a.client = client
-			a.hello, err = client.Hello()
+		if client, err = client.Restart(h.hello.PID); err == nil {
+			h.client = client
+			h.hello, err = client.Hello()
 		} else {
 			log.Print(err)
 			mygo.Dialog.Error("GoRex could not restart its session server", err.Error())
@@ -85,7 +94,7 @@ func (a *App) open() {
 			return
 		}
 	}
-	if err == nil && a.hello.Version != rex.ProtocolVersion {
+	if err == nil && h.hello.Version != rex.ProtocolVersion {
 		a.err = "The session server is of another version of GoRex: quit and end all sessions to restart it."
 	}
 	a.reset()
@@ -109,53 +118,68 @@ func (a *App) open() {
 	a.win = win
 	if !a.restore() {
 		home, _ := os.UserHomeDir()
-		a.newTab(home)
+		a.newTabOn(h, home)
 	}
+	// The remote hosts connect in the background: their tabs show as
+	// they load.
+	a.openRemotes()
 	a.changed()
-	go a.poll(win, client)
+	go a.poll(win, h)
 	a.debugHook()
 	win.OnClosed(func() {
 		a.saveNow()
 		a.quitting = true
-		for _, t := range a.tabs {
-			for _, p := range t.panes() {
-				p.closed = true
-				if p.term != nil {
-					p.term.Close() // detaches: the session goes on
-				}
+		for _, p := range a.allPanes() {
+			p.closed = true
+			if p.term != nil {
+				p.term.Close() // detaches: the session goes on
 			}
 		}
-		a.client.Close()
+		for _, h := range a.hosts {
+			if h.client != nil {
+				h.client.Close()
+			}
+		}
 		a.win = nil
 	})
 }
 
-// saveNow sends the layout to the server and waits for it to be kept.
+// saveNow sends the layouts to the servers and waits a moment for them
+// to be kept.
 func (a *App) saveNow() {
-	if a.client == nil || len(a.tabs) == 0 && !a.quitting {
-		return
+	done := make(chan struct{}, len(a.hosts))
+	n := 0
+	for _, h := range a.hosts {
+		if h.client == nil || !h.loaded || len(h.tabs) == 0 && !a.quitting {
+			continue
+		}
+		b, err := json.Marshal(a.snapshotOf(h))
+		if err != nil {
+			continue
+		}
+		h.lastSnapshot = string(b)
+		c := h.client
+		n++
+		go func() {
+			c.SetLayout(b)
+			done <- struct{}{}
+		}()
 	}
-	b, err := json.Marshal(a.snapshot())
-	if err != nil {
-		return
-	}
-	done := make(chan struct{})
-	go func() {
-		a.client.SetLayout(b)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
+	timeout := time.After(time.Second)
+	for range n {
+		select {
+		case <-done:
+		case <-timeout:
+			return
+		}
 	}
 }
 
-// reset forgets the state of a window that closed, keeping the server's
-// connection, for the next window.
+// reset forgets the state of a window that closed, for the next window.
 func (a *App) reset() {
-	a.tabs, a.active, a.focusReq = nil, 0, nil
-	a.paletteOpen, a.hostOpen, a.renaming = false, false, nil
-	a.saveDue, a.quitting, a.lastSnapshot, a.title = false, false, "", ""
+	a.focusReq = nil
+	a.paletteOpen, a.hostOpen, a.renaming, a.addOpen = false, false, nil, false
+	a.saveDue, a.quitting, a.title = false, false, ""
 }
 
 // staleServer reports whether the server runs another build of the app

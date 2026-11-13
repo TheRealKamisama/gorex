@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -56,6 +57,10 @@ var (
 	cmdDark        = command{Title: "Appearance: Dark", Run: func(a *App) { a.setAppearance("dark") }}
 	cmdSystem      = command{Title: "Appearance: System", Run: func(a *App) { a.setAppearance("") }}
 	cmdEndAll      = command{Title: "Quit and End All Sessions", Accel: "CmdOrCtrl+Alt+Q", Keys: "⌥⌘Q", Run: func(a *App) { a.quitAndEnd() }}
+	cmdAddHost     = command{Title: "Add Remote Host…", Run: func(a *App) { a.openAddHost() }}
+	cmdReconnect   = command{Title: "Reconnect to Host", Run: func(a *App) { a.reconnectHost(a.host) }}
+	cmdDisconnect  = command{Title: "Disconnect from Host", Run: func(a *App) { a.disconnectHost(a.host) }}
+	cmdThisMachine = command{Title: "Show This Computer", Run: func(a *App) { a.selectHost(a.local()) }}
 )
 
 // paletteCommands are those the command palette lists, before the tabs.
@@ -66,6 +71,7 @@ var paletteCommands = []*command{
 	&cmdGrowLeft, &cmdGrowRight, &cmdGrowUp, &cmdGrowDown,
 	&cmdBigger, &cmdSmaller, &cmdActualSize, &cmdLight, &cmdDark, &cmdSystem,
 	&cmdClearScroll, &cmdRestart, &cmdEndAll,
+	&cmdAddHost, &cmdReconnect, &cmdDisconnect, &cmdThisMachine,
 }
 
 // commands are all of them.
@@ -163,6 +169,13 @@ func (a *App) menu() *mygo.Menu {
 			item(&cmdRestart),
 			item(&cmdEndAll),
 		}},
+		{Label: "Hosts", Submenu: []*mygo.MenuItem{
+			item(&cmdThisMachine),
+			mygo.Separator(),
+			item(&cmdAddHost),
+			item(&cmdReconnect),
+			item(&cmdDisconnect),
+		}},
 		{Label: "Edit", Submenu: []*mygo.MenuItem{
 			{Role: mygo.RoleUndo},
 			{Role: mygo.RoleRedo},
@@ -240,15 +253,15 @@ func (a *App) closeActiveTab() {
 // showTab shows the nth tab, from 1; 9 is the last.
 func (a *App) showTab(n int) {
 	if n == 9 {
-		a.selectTab(len(a.tabs) - 1)
+		a.selectTab(len(a.host.tabs) - 1)
 	} else {
 		a.selectTab(n - 1)
 	}
 }
 
 func (a *App) cycleTab(d int) {
-	if n := len(a.tabs); n > 1 {
-		a.selectTab(((a.active+d)%n + n) % n)
+	if n := len(a.host.tabs); n > 1 {
+		a.selectTab(((a.host.active+d)%n + n) % n)
 	}
 }
 
@@ -282,14 +295,16 @@ func (a *App) restartFocused() {
 	if old.term != nil {
 		cols, rows = old.term.Size()
 	}
-	p := a.newPane(a.currentDir(), cols, rows)
+	p := a.newPaneOn(old.host, a.currentDir(), cols, rows)
 	p.Tab, p.Node = t, old.Node
 	old.Node.Pane = p
 	old.closed = true
 	if old.term != nil {
 		old.term.Close()
 	}
-	go a.client.Kill(old.SID)
+	if c := old.host.client; c != nil && old.SID != "" {
+		go c.Kill(old.SID)
+	}
 	if t.Zoom == old {
 		t.Zoom = p
 	}
@@ -299,14 +314,14 @@ func (a *App) restartFocused() {
 	a.changed()
 }
 
+// quitAndEnd quits, ending this machine's sessions; those of remote
+// hosts go on there.
 func (a *App) quitAndEnd() {
 	a.quitting = true
-	for _, t := range a.tabs {
-		for _, p := range t.panes() {
-			p.closed = true
-		}
+	for _, p := range a.allPanes() {
+		p.closed = true
 	}
-	c := a.client
+	c := a.local().client
 	go func() {
 		c.Shutdown()
 		mygo.App.Quit()
@@ -355,7 +370,7 @@ func (a *App) paletteItems() []paletteItem {
 	var items []paletteItem
 	q := strings.ToLower(strings.TrimSpace(a.paletteQuery))
 	match := func(s string) bool { return q == "" || fuzzy(strings.ToLower(s), q) }
-	for ti, t := range a.tabs {
+	for ti, t := range a.host.tabs {
 		for _, p := range t.panes() {
 			name, detail := p.label()
 			if !match(fmt.Sprintf("%s %s tab %d", name, detail, ti+1)) {
@@ -373,8 +388,26 @@ func (a *App) paletteItems() []paletteItem {
 			})
 		}
 	}
+	for _, h := range a.hosts {
+		if h == a.host {
+			continue
+		}
+		title := "Switch to " + h.name()
+		if !match(title + " host") {
+			continue
+		}
+		h := h
+		glyph := "server"
+		if !h.isRemote() {
+			glyph = "laptop"
+		}
+		items = append(items, paletteItem{title: title, detail: h.statusLine(time.Now()), glyph: glyph, keys: "Host", run: func() { a.selectHost(h) }})
+	}
 	for _, cmd := range paletteCommands {
 		if cmd.Hidden || !match(cmd.Title) {
+			continue
+		}
+		if (cmd == &cmdReconnect || cmd == &cmdDisconnect) && !a.host.isRemote() || cmd == &cmdThisMachine && a.host == a.local() {
 			continue
 		}
 		cmd := cmd

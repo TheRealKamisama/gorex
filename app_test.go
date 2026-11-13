@@ -66,7 +66,7 @@ func newTestApp(t *testing.T) (*App, *ui.Tester) {
 		os.RemoveAll(dir)
 	})
 	registerFonts()
-	a := &App{client: client}
+	a := newApp(client)
 	a.newTab(os.TempDir())
 	tt := ui.NewTester(a.view, 1000, 620)
 	return a, tt
@@ -75,12 +75,12 @@ func newTestApp(t *testing.T) (*App, *ui.Tester) {
 // refresh asks the server what runs in the sessions, as the window does
 // every half second.
 func refresh(a *App) {
-	infos, _ := a.client.List()
+	infos, _ := a.local().client.List()
 	byID := map[string]rex.SessionInfo{}
 	for _, in := range infos {
 		byID[in.ID] = in
 	}
-	a.apply(byID)
+	a.apply(a.local(), byID)
 }
 
 // waitFor runs frames until cond holds, or fails after a few seconds.
@@ -161,20 +161,20 @@ func TestPanesAndTabs(t *testing.T) {
 
 	// A second tab, renamed, then closed with its pane.
 	a.newTab(os.TempDir())
-	if len(a.tabs) != 2 || a.active != 1 {
-		t.Fatalf("%d tabs, active %d", len(a.tabs), a.active)
+	if len(a.host.tabs) != 2 || a.host.active != 1 {
+		t.Fatalf("%d tabs, active %d", len(a.host.tabs), a.host.active)
 	}
 	a.startRename()
 	tt.Frame()
 	tt.Type("logs")
 	tt.Key(0, ui.KeyEnter)
 	tt.Frame()
-	if a.tabs[1].Name != "logs" {
-		t.Errorf("tab named %q", a.tabs[1].Name)
+	if a.host.tabs[1].Name != "logs" {
+		t.Errorf("tab named %q", a.host.tabs[1].Name)
 	}
 	a.closeFocused()
-	if len(a.tabs) != 1 || a.active != 0 {
-		t.Fatalf("%d tabs, active %d, after closing the last pane of a tab", len(a.tabs), a.active)
+	if len(a.host.tabs) != 1 || a.host.active != 0 {
+		t.Fatalf("%d tabs, active %d, after closing the last pane of a tab", len(a.host.tabs), a.host.active)
 	}
 
 	// A shell that exits closes its pane.
@@ -189,28 +189,28 @@ func TestRestore(t *testing.T) {
 	a.split(false)
 	a.tab().Root.Ratio = 0.3
 	a.newTab(testShell.dir)
-	a.tabs[1].Name = "second"
+	a.host.tabs[1].Name = "second"
 	tt.Frame()
 	a.saveNow()
 	sids := map[string]bool{}
-	for _, tab := range a.tabs {
+	for _, tab := range a.host.tabs {
 		for _, p := range tab.panes() {
 			sids[p.SID] = true
 			p.term.Close() // detach, as when the app quits
 		}
 	}
 	// Another app, as the next launch, finds them all.
-	b := &App{client: a.client}
+	b := newApp(a.local().client)
 	if !b.restore() {
 		t.Fatal("nothing restored")
 	}
-	if len(b.tabs) != 2 || b.tabs[1].Name != "second" || b.active != 1 {
-		t.Fatalf("restored %d tabs, active %d", len(b.tabs), b.active)
+	if len(b.host.tabs) != 2 || b.host.tabs[1].Name != "second" || b.host.active != 1 {
+		t.Fatalf("restored %d tabs, active %d", len(b.host.tabs), b.host.active)
 	}
-	if r := b.tabs[0].Root; r.Pane != nil || r.Ratio != 0.3 {
+	if r := b.host.tabs[0].Root; r.Pane != nil || r.Ratio != 0.3 {
 		t.Errorf("first tab's root %+v", r)
 	}
-	for _, tab := range b.tabs {
+	for _, tab := range b.host.tabs {
 		for _, p := range tab.panes() {
 			if !sids[p.SID] || p.restored {
 				t.Errorf("pane of session %q not attached again", p.SID)
@@ -255,7 +255,7 @@ func TestLabels(t *testing.T) {
 // must not hide it.
 func TestCloseButtons(t *testing.T) {
 	a, tt := newTestApp(t)
-	first := a.tabs[0]
+	first := a.host.tabs[0]
 	a.newTab(os.TempDir())
 	tt.Frame()
 	track, ok := tt.Find("Tabs")
@@ -273,8 +273,8 @@ func TestCloseButtons(t *testing.T) {
 	tt.Frame()
 	tt.Release(x.X+x.W/2, x.Y+x.H/2)
 	tt.Frame()
-	if len(a.tabs) != 1 || slices.Contains(a.tabs, first) {
-		t.Fatalf("%d tabs after clicking the first one's close button", len(a.tabs))
+	if len(a.host.tabs) != 1 || slices.Contains(a.host.tabs, first) {
+		t.Fatalf("%d tabs after clicking the first one's close button", len(a.host.tabs))
 	}
 
 	// A pane without the focus shows its buttons under the pointer.
@@ -302,7 +302,7 @@ func TestCloseButtons(t *testing.T) {
 // it shows, and that the keys bring the selection back into view.
 func TestPaletteScrolls(t *testing.T) {
 	registerFonts()
-	a := &App{}
+	a := newApp(nil)
 	tab := &Tab{ID: 1}
 	for i := range 20 {
 		n := &Node{Pane: &Pane{ID: i, Tab: tab, info: rex.SessionInfo{Shell: fmt.Sprintf("shell%02d", i)}}}
@@ -313,7 +313,7 @@ func TestPaletteScrolls(t *testing.T) {
 			tab.Root = &Node{A: tab.Root, B: n, Ratio: 0.5}
 		}
 	}
-	a.tabs = []*Tab{tab}
+	a.host.tabs = []*Tab{tab}
 	tt := ui.NewTester(func(c *ui.Context) { a.palette(c, colorsOf(c)) }, 1000, 620)
 	a.openPalette()
 	tt.Frame()

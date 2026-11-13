@@ -50,28 +50,78 @@ type attached struct {
 	conn net.Conn
 	out  chan []byte
 	once sync.Once
+	// first is the snapshot the writer sends before the output, made to
+	// the client's size of scrollback, aside from the session's lock.
+	first      []byte
+	cols, rows int
+	scrollback int
+	// queued is how many bytes of output wait for the writer, and backlog
+	// how many may before the client is dropped.
+	queued  atomic.Int64
+	backlog int64
+	// dropped tells a client dropped as too far behind, whose writer
+	// drops what is left to write: attaching again, it gets the screen.
+	dropped atomic.Bool
 }
 
+// defaultBacklog is the bytes of output that may wait for a client that
+// gives no backlog of its own: a window on this machine, which only falls
+// that far behind when it hangs.
+const defaultBacklog = 64 << 20
+
 func (a *attached) send(p []byte) bool {
+	if a.queued.Add(int64(len(p))) > a.backlog {
+		return false // too far behind: drop it, it attaches again
+	}
 	select {
 	case a.out <- p:
 		return true
 	default:
-		return false // too far behind: drop it, it attaches again
+		return false
 	}
 }
 
+// finish ends the output once the writer wrote what waits.
 func (a *attached) finish() { a.once.Do(func() { close(a.out) }) }
 
+// drop ends the output at once.
+func (a *attached) drop() {
+	a.dropped.Store(true)
+	a.finish()
+}
+
 func (a *attached) writer() {
+	if a.scrollback > 0 && len(a.first) > a.scrollback {
+		a.first = trimSnapshot(a.first, a.cols, a.rows, a.scrollback)
+	}
+	_, err := a.conn.Write(a.first)
+	a.first = nil
 	for p := range a.out {
-		if _, err := a.conn.Write(p); err != nil {
-			break
+		a.queued.Add(-int64(len(p)))
+		if err != nil || a.dropped.Load() {
+			continue
 		}
+		_, err = a.conn.Write(p)
 	}
 	a.conn.Close()
-	for range a.out {
+}
+
+// trimSnapshot returns a snapshot with about limit bytes of scrollback: a
+// terminal of so much scrollback is fed it, and snapshot in turn.
+func trimSnapshot(snap []byte, cols, rows, limit int) []byte {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	vt, err := terminal.New(terminal.Options{Conn: discard{pr}, Scrollback: limit})
+	if err != nil {
+		return snap
 	}
+	defer vt.Close()
+	vt.Resize(cols, rows)
+	vt.Feed(snap)
+	if out := vt.Snapshot(); len(out) > 0 {
+		return out
+	}
+	return snap
 }
 
 func newSession(id string, o CreateOptions) (*session, error) {
@@ -84,7 +134,8 @@ func newSession(id string, o CreateOptions) (*session, error) {
 		cols, rows = 80, 24
 	}
 	dir := o.Dir
-	if dir == "" {
+	if st, err := os.Stat(dir); dir == "" || err != nil || !st.IsDir() {
+		// As when the directory of a pane a client restores is gone.
 		dir, _ = os.UserHomeDir()
 	}
 	env := sessionEnv(id, o.Env)
@@ -147,6 +198,7 @@ func sessionEnv(id string, extra []string) []string {
 		case k == "TERM", k == "COLORTERM", k == "TERM_PROGRAM", k == "TERM_PROGRAM_VERSION",
 			k == "TERM_SESSION_ID", k == "TMUX", k == "TMUX_PANE", k == "STY", k == "WINDOWID",
 			k == "COLUMNS", k == "LINES", k == "SHLVL", k == "OLDPWD", k == "PWD", k == "_",
+			k == "SSH_TTY", // the bridge's, when ssh started the server
 			strings.HasPrefix(k, "ITERM_"), strings.HasPrefix(k, "GHOSTTY_"), strings.HasPrefix(k, "KITTY_"),
 			strings.HasPrefix(k, "VSCODE_"), strings.HasPrefix(k, "WEZTERM_"), strings.HasPrefix(k, "ALACRITTY_"),
 			strings.HasPrefix(k, "GOREX_"), strings.HasPrefix(k, "MYGO_"):
@@ -181,7 +233,7 @@ func (s *session) read() {
 			s.lastOutput = time.Now()
 			for a := range s.clients {
 				if !a.send(data) {
-					a.finish()
+					a.drop()
 					delete(s.clients, a)
 				}
 			}
@@ -196,19 +248,27 @@ func (s *session) read() {
 // attach attaches a connection: it gets a snapshot of the session's
 // screen and scrollback at its size, then what the session prints, and
 // what it sends is typed.
-func (s *session) attach(conn net.Conn, cols, rows int) {
-	a := &attached{conn: conn, out: make(chan []byte, 2048)}
+func (s *session) attach(conn net.Conn, at Attach) {
+	cols, rows := at.Cols, at.Rows
+	a := &attached{conn: conn, out: make(chan []byte, 2048), scrollback: at.Scrollback, backlog: int64(at.Backlog)}
+	if a.backlog <= 0 {
+		a.backlog = defaultBacklog
+	}
 	s.mu.Lock()
 	if cols > 0 && rows > 0 {
 		// The screen reflows to the window's size, which the program
 		// learns next.
 		s.vt.Resize(cols, rows)
 	}
+	a.cols, a.rows = s.cols, s.rows
+	if cols > 0 && rows > 0 {
+		a.cols, a.rows = cols, rows
+	}
 	snap := s.vt.Snapshot()
 	if title := s.vt.Title(); title != "" {
 		snap = append([]byte("\x1b]2;"+title+"\x07"), snap...)
 	}
-	a.out <- snap
+	a.first = snap
 	exited := s.exited
 	if exited {
 		a.finish()
@@ -298,7 +358,7 @@ func (s *session) resyncScreen() {
 	msg := append([]byte("\x1b[?1049h\x1b[H\x1b[2J"), snap...)
 	for a := range s.clients {
 		if !a.send(msg) {
-			a.finish()
+			a.drop()
 			delete(s.clients, a)
 		}
 	}

@@ -7,6 +7,8 @@ import (
 
 	"github.com/egoist/mygo/plugins/terminal"
 	"github.com/egoist/mygo/ui"
+
+	"gorex/internal/rex"
 )
 
 const (
@@ -21,13 +23,25 @@ func (a *App) view(c *ui.Context) {
 	a.services = c.Services()
 	a.runPosted()
 	k := colorsOf(c)
-	a.focusedWin = a.win == nil || a.win.IsFocused()
+	focused := a.win == nil || a.win.IsFocused()
+	if focused && !a.focusedWin {
+		// Back to the front, as after the computer woke up: the remote
+		// hosts waiting to connect again try at once.
+		for _, h := range a.hosts {
+			if h.isRemote() && h.client != nil && h.status().State == rex.Waiting {
+				h.client.Kick()
+			}
+		}
+	}
+	a.focusedWin = focused
 	c.Root().Background(k.bgBottom)
 	ui.Column(c).Fill().Draw(func(p *ui.Painter, r ui.Rect) { paintBackground(p, r, k) }).Children(func() {
 		a.titleBar(c, k)
 		ui.Column(c).Grow(1).MinHeight(0).Padding(0, gap, gap, gap).Children(func() {
 			if t := a.tab(); t != nil {
 				a.tabContent(c, k, t)
+			} else if a.host.isRemote() || !a.host.ready() {
+				a.hostPlaceholder(c, k)
 			}
 		})
 	})
@@ -36,6 +50,7 @@ func (a *App) view(c *ui.Context) {
 	}
 	a.shortcuts(c)
 	a.palette(c, k)
+	a.addHostDialog(c, k)
 	if a.saveDue && time.Since(a.lastSave) > time.Second {
 		a.save()
 	}
@@ -66,7 +81,9 @@ func (a *App) titleBar(c *ui.Context, k *colors) {
 	}
 	ui.Row(c).Height(titleH).Padding(0, max(bar.Right, 10), 0, left).Gap(14).AlignItems(ui.Center).DragWindow().Children(func() {
 		a.hostChip(c, k)
-		a.tabStrip(c, k)
+		if len(a.host.tabs) > 0 {
+			a.tabStrip(c, k)
+		}
 		// The title bar between the tabs and the buttons, which drags the
 		// window, and a double click on which zooms it.
 		ui.Spacer(c).MinWidth(titleFree - 14)
@@ -241,6 +258,10 @@ func (a *App) paneCard(c *ui.Context, k *colors, t *Tab, p *Pane) ui.Element {
 				return
 			}
 			tv := terminal.View(c, p.term).Fill()
+			if p.offline() {
+				// What is typed goes nowhere until the host is back.
+				tv.Opacity(0.5)
+			}
 			if a.focusReq == p && a.tab() == t {
 				tv.Focus()
 				a.focusReq = nil
@@ -344,6 +365,14 @@ func (a *App) statusOf(c *ui.Context, p *Pane) status {
 // activityBadge shows what a pane does: a pulse while its program
 // prints, a dot when it asks for attention.
 func (a *App) activityBadge(c *ui.Context, k *colors, p *Pane) {
+	if p.offline() {
+		c.After(time.Second)
+		ui.Row(c).Gap(5).AlignItems(ui.Center).Margin(0, 0, 0, 4).Shrink(0).Children(func() {
+			ui.Box(c).Size(7, 7).Radius(4).Background(hostDot(p.host, k))
+			ui.Text(c, p.host.statusLine(c.Now())).FontSize(11.5).TextColor(k.textFaint).SingleLine()
+		})
+		return
+	}
 	switch a.statusOf(c, p) {
 	case statusRunning:
 		activityDot(c, k.busy, 6)
@@ -380,4 +409,17 @@ func (a *App) errorBanner(c *ui.Context, k *colors) {
 			})
 		})
 	})
+}
+
+// offline tells a pane of a remote host out of reach, or one whose
+// stream attaches again.
+func (p *Pane) offline() bool {
+	h := p.host
+	if h == nil || !h.isRemote() {
+		return false
+	}
+	if !h.up() {
+		return true
+	}
+	return p.stream != nil && !p.stream.Attached() && time.Since(time.Unix(0, p.lastData.Load())) > time.Second && p.stream.Started()
 }

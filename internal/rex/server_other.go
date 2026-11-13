@@ -13,3 +13,6 @@ func Serve() error { return errUnsupported }
 func Spawn() error { return errUnsupported }
 
 func processAlive(int) bool { return false }
+
+// Bridge serves a client through ssh; not on this platform.
+func Bridge() error { return errUnsupported }

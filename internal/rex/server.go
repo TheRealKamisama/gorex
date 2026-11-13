@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"time"
@@ -22,6 +23,9 @@ import (
 
 // Server owns the sessions.
 type Server struct {
+	// createMu makes one session at a time, so that two requests for the
+	// session of an ID make one.
+	createMu sync.Mutex
 	mu       sync.Mutex
 	sessions map[string]*session
 	order    []string
@@ -143,8 +147,22 @@ func (s *Server) handle(conn net.Conn) {
 		s.mu.Lock()
 		ss := s.sessions[a.SID]
 		s.mu.Unlock()
+		if ss == nil && a.Create != nil {
+			o := *a.Create
+			o.ID = a.SID
+			if a.Cols > 0 && a.Rows > 0 {
+				o.Cols, o.Rows = a.Cols, a.Rows
+			}
+			var err error
+			if ss, err = s.create(o); err != nil {
+				b, _ := json.Marshal(map[string]string{"error": "creating the session: " + err.Error()})
+				conn.Write(append(b, '\n'))
+				conn.Close()
+				return
+			}
+		}
 		if ss == nil {
-			conn.Write([]byte(`{"error":"no such session"}` + "\n"))
+			conn.Write([]byte(`{"error":"` + errNoSession + `"}` + "\n"))
 			conn.Close()
 			return
 		}
@@ -154,7 +172,7 @@ func (s *Server) handle(conn net.Conn) {
 			b, _ := r.Peek(n)
 			ss.input(b)
 		}
-		ss.attach(conn, a.Cols, a.Rows)
+		ss.attach(conn, a)
 		return
 	}
 	s.control(conn, r, first)
@@ -215,7 +233,39 @@ func (s *Server) session(id string) (*session, error) {
 	if ss := s.sessions[id]; ss != nil {
 		return ss, nil
 	}
-	return nil, fmt.Errorf("no session %q", id)
+	return nil, fmt.Errorf("%s %q", errNoSession, id)
+}
+
+// errNoSession starts the errors about a session the server does not
+// have, which clients tell from others.
+const errNoSession = "no such session"
+
+// create makes a session, or returns the one of o.ID made before.
+func (s *Server) create(o CreateOptions) (*session, error) {
+	s.createMu.Lock()
+	defer s.createMu.Unlock()
+	if o.ID != "" {
+		if !validID(o.ID) {
+			return nil, fmt.Errorf("bad session ID %q", o.ID)
+		}
+		s.mu.Lock()
+		ss := s.sessions[o.ID]
+		s.mu.Unlock()
+		if ss != nil {
+			return ss, nil
+		}
+	} else {
+		o.ID = newID()
+	}
+	ss, err := newSession(o.ID, o)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.sessions[o.ID] = ss
+	s.order = append(s.order, o.ID)
+	s.mu.Unlock()
+	return ss, nil
 }
 
 func (s *Server) do(req Request) (any, error) {
@@ -225,7 +275,10 @@ func (s *Server) do(req Request) (any, error) {
 		case <-s.hostDone:
 		case <-time.After(3 * time.Second):
 		}
-		return Hello{Version: ProtocolVersion, PID: os.Getpid(), Started: s.started, Host: s.host, Exe: s.exe, ExeTime: s.exeTime}, nil
+		return Hello{
+			Version: ProtocolVersion, PID: os.Getpid(), Started: s.started, Host: s.host,
+			Exe: s.exe, ExeTime: s.exeTime, Platform: runtime.GOOS + "/" + runtime.GOARCH,
+		}, nil
 	case "list":
 		s.mu.Lock()
 		all := make([]*session, 0, len(s.order))
@@ -243,15 +296,16 @@ func (s *Server) do(req Request) (any, error) {
 		if req.Create != nil {
 			o = *req.Create
 		}
-		id := newID()
-		ss, err := newSession(id, o)
+		ss, err := s.create(o)
 		if err != nil {
 			return nil, err
 		}
-		s.mu.Lock()
-		s.sessions[id] = ss
-		s.order = append(s.order, id)
-		s.mu.Unlock()
+		return ss.info(), nil
+	case "info":
+		ss, err := s.session(req.SID)
+		if err != nil {
+			return nil, err
+		}
 		return ss.info(), nil
 	case "kill":
 		ss, err := s.session(req.SID)
